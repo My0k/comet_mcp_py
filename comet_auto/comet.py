@@ -68,9 +68,10 @@ class CometController:
         paths = _default_comet_paths()
         return paths[0] if paths else None
 
-    def start_comet(self) -> None:
+    def start_comet(self, force_restart: bool = False) -> None:
         if _port_ready(self.cfg.debug_port):
-            return
+            if not force_restart:
+                return
 
         if not self.cfg.auto_launch:
             raise RuntimeError(
@@ -97,8 +98,13 @@ class CometController:
         if hasattr(subprocess, "DETACHED_PROCESS") and hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):
             creationflags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
 
+        args = [
+            exe,
+            f"--remote-debugging-port={self.cfg.debug_port}",
+            "--remote-allow-origins=*",
+        ]
         subprocess.Popen(
-            [exe, f"--remote-debugging-port={self.cfg.debug_port}"],
+            args,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             creationflags=creationflags,
@@ -134,7 +140,30 @@ class CometController:
         if not ws_url:
             raise RuntimeError("No webSocketDebuggerUrl en el target seleccionado.")
 
-        self.cdp.connect(ws_url)
+        try:
+            self.cdp.connect(ws_url)
+        except Exception as e:
+            msg = str(e)
+            looks_like_allow_origins = (
+                "Handshake status 403" in msg
+                or "403 Forbidden" in msg
+                or "Rejected an incoming WebSocket connection" in msg
+                or "remote-allow-origins" in msg
+            )
+            if looks_like_allow_origins and self.cfg.restart_if_no_debug_port and self.cfg.auto_launch:
+                # Comet was started without --remote-allow-origins, restart with required flag.
+                self.start_comet(force_restart=True)
+                targets = self.list_targets()
+                page_targets = [t for t in targets if t.get("type") == "page"]
+                perplexity = next((t for t in page_targets if "perplexity.ai" in (t.get("url") or "")), None)
+                chosen = perplexity or (page_targets[0] if page_targets else self.new_tab(self.cfg.perplexity_url))
+                ws_url = chosen.get("webSocketDebuggerUrl")
+                if not ws_url:
+                    raise RuntimeError("No webSocketDebuggerUrl en el target seleccionado tras reinicio.") from e
+                self.cdp.connect(ws_url)
+                self._active_target_id = chosen.get("id")
+            else:
+                raise
         self._active_target_id = chosen.get("id")
 
         for method in ["Page.enable", "Runtime.enable", "DOM.enable", "Network.enable"]:

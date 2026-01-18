@@ -31,6 +31,16 @@ Si Perplexity requiere login, inicia sesión manualmente en esa ventana de Comet
 - CLI: `run_comet_auto_cli.bat "tu prompt"`
 - Debug (logs en stderr): `set COMET_AUTO_DEBUG=1` antes de ejecutar, o usa `--debug` en CLI.
 
+## Modo API (LAN)
+
+1) Ejecuta `run_comet_auto_api.bat` (opcional: `run_comet_auto_api.bat 8787`)
+2) Desde otro PC en la misma red, usa la IP del PC servidor:
+
+- `GET http://IP_DEL_SERVIDOR:8787/health`
+- `POST http://IP_DEL_SERVIDOR:8787/ask` con JSON `{"prompt":"...", "new_chat": false, "timeout_s": 120}`
+
+Opcional (recomendado): define `COMET_AUTO_API_KEY` en el PC servidor y envía `Authorization: Bearer <key>` o header `X-API-Key`.
+
 ## Notas de implementación
 
 - La lógica reutiliza el patrón de `example_mcp_comet`: conexión por CDP, `Runtime.evaluate` para escribir/enviar y *smart completion* por estabilidad de respuesta y presencia/ausencia de botón “Stop”.

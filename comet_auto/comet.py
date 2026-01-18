@@ -63,7 +63,7 @@ class CometController:
         self._active_target_id: str | None = None
         self._last_response_text = ""
         self._stable_count = 0
-        self._stability_threshold = 2
+        self._stability_threshold = 3
 
     @staticmethod
     def detect_comet_exe() -> str | None:
@@ -302,6 +302,7 @@ class CometController:
             """
             (() => {
               const bodyText = (document.body && document.body.innerText) ? document.body.innerText : '';
+              const main = document.querySelector('main') || document.querySelector('[role="main"]') || document.body;
 
               let hasStop = false;
               for (const btn of document.querySelectorAll('button')) {
@@ -345,7 +346,7 @@ class CometController:
               let response = '';
 
               // Strategy 1: Content after "X steps completed" marker (agentic final answer)
-              const stepsMatch = bodyText.match(/\\d+\\s+steps?\\s+completed/i);
+              const stepsMatch = bodyText.match(/\\d+\\s+(steps?|pasos?)\\s+(completed|completad[oa]s?)/i);
               if (stepsMatch) {
                 const markerIndex = bodyText.indexOf(stepsMatch[0]);
                 if (markerIndex !== -1) {
@@ -386,20 +387,38 @@ class CometController:
               }
 
               // Strategy 3: Fallback to prose blocks
-              const proseEls = [...document.querySelectorAll('[class*="prose"]')];
-              const texts = proseEls
+              const selectors = [
+                '[class*="prose"]',
+                '[class*="Prose"]',
+                '[class*="markdown"]',
+                '[class*="Markdown"]',
+                '[data-testid*="answer"]',
+                '[class*="answer"]'
+              ];
+              const candidateEls = [];
+              for (const sel of selectors) {
+                try { candidateEls.push(...main.querySelectorAll(sel)); } catch {}
+              }
+
+              const texts = [...new Set(candidateEls)]
                 .filter(el => {
                   if (el.closest('nav, aside, header, footer, form, [contenteditable]')) return false;
                   const t = (el.innerText || '').trim();
                   if (!t) return false;
                   const uiStarts = ['Library','Discover','Spaces','Finance','Account','Upgrade','Home','Search'];
                   if (uiStarts.some(s => t.startsWith(s))) return false;
-                  return t.length > 30;
+                  return t.length > 10;
                 })
                 .map(el => el.innerText.trim());
 
-              if ((!response || response.length < 80) && texts.length > 0) {
-                response = texts.slice(-3).join('\\n\\n');
+              if ((!response || response.length < 120) && texts.length > 0) {
+                // Take more blocks: answers often split headings + bullet lists
+                response = texts.slice(-12).join('\\n\\n');
+              }
+
+              // Strategy 4: As a last resort, use main text (trimmed)
+              if ((!response || response.length < 120) && main && main.innerText) {
+                response = main.innerText.trim();
               }
 
               // Clean response a bit (UI artifacts)
@@ -423,7 +442,7 @@ class CometController:
               }
 
               // Completion heuristic (signal-only; stability handled in Python loop)
-              if (!hasStop && !hasLoading && response && response.length > 50 && hasFollowup) status = 'completed';
+              if (!hasStop && !hasLoading && response && response.length > 120 && hasFollowup) status = 'completed';
               return { status, steps, currentStep: steps.length ? steps[steps.length-1] : '', response, hasStopButton: hasStop, hasLoading, hasFollowup };
             })()
             """
@@ -510,6 +529,9 @@ class CometController:
         last_activity = time.time()
         prev_response = ""
         saw_response = False
+        done_candidate_at: float | None = None
+        done_candidate_response: str = ""
+        grace_s = 3.0
 
         while time.time() < deadline:
             st = self.get_agent_status()
@@ -517,23 +539,25 @@ class CometController:
                 prev_response = st.response
                 last_activity = time.time()
                 saw_response = True
+                done_candidate_at = None
 
-            # Only consider done when stop/loading are gone
-            if st.status == "completed" and saw_response and st.response and not st.has_stop_button and not st.has_loading:
-                return st.response
+            now = time.time()
+            idle_s = now - last_activity
 
-            if st.is_stable and saw_response and st.response and not st.has_stop_button and not st.has_loading:
-                return st.response
-
-            if (
-                time.time() - last_activity > 6
-                and saw_response
-                and st.response
-                and len(st.response) > 100
-                and not st.has_stop_button
-                and not st.has_loading
-            ):
-                return st.response
+            # Candidate "done" conditions (don't return immediately; confirm with grace window)
+            is_done_signal = (
+                st.status == "completed"
+                or (st.is_stable and len(st.response) > 120)
+                or (idle_s > 8 and len(st.response) > 200)
+            )
+            if saw_response and st.response and not st.has_stop_button and not st.has_loading and is_done_signal:
+                if done_candidate_at is None or done_candidate_response != st.response:
+                    done_candidate_at = now
+                    done_candidate_response = st.response
+                elif now - done_candidate_at >= grace_s:
+                    return st.response
+            else:
+                done_candidate_at = None
 
             time.sleep(1.0)
 

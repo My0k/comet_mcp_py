@@ -164,6 +164,8 @@ class MainWindow(QtWidgets.QMainWindow):
         cleaned = text.strip()
         self.output.appendPlainText(cleaned + "\n")
         print(cleaned, flush=True)
+        print("===COMPLETED===", flush=True)
+        self.output.appendPlainText("===COMPLETED===\n")
 
     def _on_error(self, text: str) -> None:
         self.status.setText("Error")

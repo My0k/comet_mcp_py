@@ -24,6 +24,8 @@ class AgentStatus:
     current_step: str
     response: str
     has_stop_button: bool
+    has_loading: bool
+    has_followup_ui: bool
     is_stable: bool
 
 
@@ -304,18 +306,86 @@ class CometController:
               let hasStop = false;
               for (const btn of document.querySelectorAll('button')) {
                 const aria = (btn.getAttribute('aria-label') || '').toLowerCase();
+                const title = (btn.getAttribute('title') || '').toLowerCase();
+                const testid = (btn.getAttribute('data-testid') || '').toLowerCase();
                 const txt = (btn.innerText || '').toLowerCase();
-                const isStop = aria.includes('stop') || aria.includes('cancel') || txt === 'stop' || btn.querySelector('svg rect');
+                const isStop =
+                  aria.includes('stop') || aria.includes('cancel') ||
+                  title.includes('stop') || title.includes('cancel') ||
+                  testid.includes('stop') ||
+                  aria.includes('detener') || aria.includes('cancelar') ||
+                  title.includes('detener') || title.includes('cancelar') ||
+                  txt === 'stop' || txt === 'detener' || txt === 'cancelar' ||
+                  btn.querySelector('svg rect');
                 if (isStop && btn.offsetParent !== null && !btn.disabled) { hasStop = true; break; }
               }
 
-              const hasLoading = document.querySelector('[class*="animate-spin"], [class*="animate-pulse"], [class*="loading"], [class*="thinking"]') !== null;
-              const hasFollowup = bodyText.includes('Ask a follow-up') || bodyText.includes('Ask follow-up');
+              const hasLoading =
+                document.querySelector('[class*="animate-spin"], [class*="animate-pulse"], [class*="loading"], [class*="thinking"]') !== null ||
+                /\\b(thinking|searching|researching|analyzing|loading)\\b/i.test(bodyText) ||
+                /\\b(pensando|buscando|investigando|analizando|cargando)\\b/i.test(bodyText);
+
+              const hasFollowup =
+                bodyText.includes('Ask a follow-up') ||
+                bodyText.includes('Ask follow-up') ||
+                bodyText.includes('Ask anything') ||
+                bodyText.includes('Type a message') ||
+                bodyText.includes('Add details') ||
+                bodyText.includes('Preguntar algo') ||
+                bodyText.includes('Pregunta algo') ||
+                bodyText.includes('Escribe un mensaje') ||
+                bodyText.includes('Añadir detalles') ||
+                bodyText.includes('Agregar detalles') ||
+                bodyText.includes('Pregunta de seguimiento');
 
               let status = 'idle';
               if (hasStop || hasLoading) status = 'working';
 
-              // Extract response from prose blocks (most reliable generic fallback)
+              // Extract response
+              let response = '';
+
+              // Strategy 1: Content after "X steps completed" marker (agentic final answer)
+              const stepsMatch = bodyText.match(/\\d+\\s+steps?\\s+completed/i);
+              if (stepsMatch) {
+                const markerIndex = bodyText.indexOf(stepsMatch[0]);
+                if (markerIndex !== -1) {
+                  let after = bodyText.substring(markerIndex + stepsMatch[0].length).trim();
+                  after = after.replace(/^[>›→\\s]+/, '').trim();
+                  const endMarkers = [
+                    'Ask anything', 'Ask a follow-up', 'Ask follow-up', 'Add details', 'Type a message',
+                    'Preguntar algo', 'Escribe un mensaje', 'Añadir detalles', 'Agregar detalles', 'Pregunta de seguimiento'
+                  ];
+                  let endIndex = after.length;
+                  for (const m of endMarkers) {
+                    const idx = after.indexOf(m);
+                    if (idx !== -1 && idx < endIndex) endIndex = idx;
+                  }
+                  response = after.substring(0, endIndex).trim();
+                }
+              }
+
+              // Strategy 2: Content after "Reviewed X sources" marker
+              if (!response || response.length < 80) {
+                const sourcesMatch = bodyText.match(/Reviewed\\s+\\d+\\s+sources?/i);
+                if (sourcesMatch) {
+                  const markerIndex = bodyText.indexOf(sourcesMatch[0]);
+                  if (markerIndex !== -1) {
+                    let after = bodyText.substring(markerIndex + sourcesMatch[0].length).trim();
+                    const endMarkers = [
+                      'Ask anything', 'Ask a follow-up', 'Ask follow-up', 'Add details', 'Type a message',
+                      'Preguntar algo', 'Escribe un mensaje', 'Añadir detalles', 'Agregar detalles', 'Pregunta de seguimiento'
+                    ];
+                    let endIndex = after.length;
+                    for (const m of endMarkers) {
+                      const idx = after.indexOf(m);
+                      if (idx !== -1 && idx < endIndex) endIndex = idx;
+                    }
+                    response = after.substring(0, endIndex).trim();
+                  }
+                }
+              }
+
+              // Strategy 3: Fallback to prose blocks
               const proseEls = [...document.querySelectorAll('[class*="prose"]')];
               const texts = proseEls
                 .filter(el => {
@@ -328,8 +398,22 @@ class CometController:
                 })
                 .map(el => el.innerText.trim());
 
-              let response = '';
-              if (texts.length > 0) response = texts.slice(-3).join('\\n\\n');
+              if ((!response || response.length < 80) && texts.length > 0) {
+                response = texts.slice(-3).join('\\n\\n');
+              }
+
+              // Clean response a bit (UI artifacts)
+              if (response) {
+                response = response
+                  .replace(/View All/gi, '')
+                  .replace(/Show more/gi, '')
+                  .replace(/Ask a follow-up/gi, '')
+                  .replace(/Ask anything\\.*/gi, '')
+                  .replace(/Type a message\\.*/gi, '')
+                  .replace(/Add details\\.*/gi, '')
+                  .replace(/\\n{3,}/g, '\\n\\n')
+                  .trim();
+              }
 
               // Basic "steps" scraping (best-effort)
               const steps = [];
@@ -338,9 +422,9 @@ class CometController:
                 if (bodyText.includes(s)) steps.push(s);
               }
 
-              // Completion heuristic
+              // Completion heuristic (signal-only; stability handled in Python loop)
               if (!hasStop && !hasLoading && response && response.length > 50 && hasFollowup) status = 'completed';
-              return { status, steps, currentStep: steps.length ? steps[steps.length-1] : '', response, hasStopButton: hasStop };
+              return { status, steps, currentStep: steps.length ? steps[steps.length-1] : '', response, hasStopButton: hasStop, hasLoading, hasFollowup };
             })()
             """
         )
@@ -361,6 +445,8 @@ class CometController:
 
         current_step = str(payload.get("currentStep") or "")
         has_stop = bool(payload.get("hasStopButton"))
+        has_loading = bool(payload.get("hasLoading"))
+        has_followup_ui = bool(payload.get("hasFollowup"))
 
         return AgentStatus(
             status=status,
@@ -368,13 +454,49 @@ class CometController:
             current_step=current_step,
             response=response[:8000],
             has_stop_button=has_stop,
+            has_loading=has_loading,
+            has_followup_ui=has_followup_ui,
             is_stable=is_stable,
         )
+
+    def _normalize_prompt(self, prompt: str) -> str:
+        # Similar to example_mcp_comet: collapse bullets/newlines for browser input reliability
+        p = prompt.strip()
+        p = "\n".join(line.lstrip("-*• ").rstrip() for line in p.splitlines())
+        p = " ".join(p.split())
+        return p.strip()
+
+    def _maybe_make_agentic(self, prompt: str) -> str:
+        has_url = "http://" in prompt or "https://" in prompt
+        has_website_ref = any(
+            w in prompt.lower()
+            for w in ["go to", "visit", "navigate", "open", "browse", "check", "look at", "click", "fill", "submit", "login", "sign in"]
+        )
+        has_site_names = any(s in prompt.lower() for s in [".com", ".org", ".io", ".net", ".ai", "website", "webpage", "page", "site"])
+        needs_agentic = has_url or has_website_ref or has_site_names
+        if not needs_agentic:
+            return prompt
+
+        lower = prompt.lower()
+        already_agentic = lower.startswith(("use your browser", "using your browser", "open a browser", "navigate to", "browse to"))
+        if already_agentic:
+            return prompt
+
+        if has_url:
+            # Extract first URL and reframe
+            for token in prompt.split():
+                if token.startswith("http://") or token.startswith("https://"):
+                    url = token
+                    rest = prompt.replace(url, "").strip()
+                    return f"Use your browser to navigate to {url} and {rest or 'tell me what you find there'}"
+        return f"Use your browser to {prompt}"
 
     def ask(self, prompt: str, new_chat: bool = False, timeout_s: float = 120.0) -> str:
         prompt = (prompt or "").strip()
         if not prompt:
             raise ValueError("prompt vacío")
+
+        prompt = self._maybe_make_agentic(self._normalize_prompt(prompt))
 
         self.reset_stability()
         self.ensure_connected()
@@ -396,13 +518,21 @@ class CometController:
                 last_activity = time.time()
                 saw_response = True
 
-            if st.status == "completed" and saw_response and st.response:
+            # Only consider done when stop/loading are gone
+            if st.status == "completed" and saw_response and st.response and not st.has_stop_button and not st.has_loading:
                 return st.response
 
-            if st.is_stable and saw_response and st.response and not st.has_stop_button:
+            if st.is_stable and saw_response and st.response and not st.has_stop_button and not st.has_loading:
                 return st.response
 
-            if time.time() - last_activity > 6 and saw_response and st.response and len(st.response) > 100 and not st.has_stop_button:
+            if (
+                time.time() - last_activity > 6
+                and saw_response
+                and st.response
+                and len(st.response) > 100
+                and not st.has_stop_button
+                and not st.has_loading
+            ):
                 return st.response
 
             time.sleep(1.0)

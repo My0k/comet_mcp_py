@@ -6,6 +6,8 @@ App simple en PyQt5 que:
 2) lo escribe en Perplexity dentro del navegador Comet usando el puerto de *remote debugging* (CDP),
 3) espera la respuesta y la imprime/visualiza.
 
+Cuando detecta que la respuesta terminó, escribe una línea `===COMPLETED===` en stdout (y también en la UI).
+
 ## Requisitos
 
 - Windows 10

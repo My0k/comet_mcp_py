@@ -41,6 +41,19 @@ Si Perplexity requiere login, inicia sesión manualmente en esa ventana de Comet
 
 Opcional (recomendado): define `COMET_AUTO_API_KEY` en el PC servidor y envía `Authorization: Bearer <key>` o header `X-API-Key`.
 
+## Cliente Flask (chat)
+
+1) Ajusta `config.conf` con la IP/puerto del servidor API.
+2) Ejecuta `run_comet_auto_client.bat`
+3) Abre `http://127.0.0.1:5050`
+
+Opcional: en `config.conf` puedes añadir:
+
+```ini
+[API]
+key = tu_api_key
+```
+
 ## Notas de implementación
 
 - La lógica reutiliza el patrón de `example_mcp_comet`: conexión por CDP, `Runtime.evaluate` para escribir/enviar y *smart completion* por estabilidad de respuesta y presencia/ausencia de botón “Stop”.

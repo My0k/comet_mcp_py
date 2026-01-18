@@ -143,52 +143,109 @@ class CometController:
 
     def connect_best_tab(self) -> None:
         self.start_comet()
-        targets = self.list_targets()
+        restarted = False
 
-        page_targets = [t for t in targets if t.get("type") == "page" and not _is_internal_url(str(t.get("url") or ""))]
-        if not page_targets:
-            t = self.new_tab(self.cfg.perplexity_url)
-            page_targets = [t]
+        while True:
+            targets = self.list_targets()
+            page_targets = [t for t in targets if t.get("type") == "page" and not _is_internal_url(str(t.get("url") or ""))]
+            if not page_targets:
+                t = self.new_tab(self.cfg.perplexity_url)
+                page_targets = [t]
 
-        perplexity = next((t for t in page_targets if "perplexity.ai" in (t.get("url") or "")), None)
-        chosen = perplexity or page_targets[0]
+            # Prefer Perplexity tab, then tabs likely to contain the assistant panel.
+            def score(t: dict[str, Any]) -> int:
+                url = str(t.get("url") or "").lower()
+                title = str(t.get("title") or "").lower()
+                if "perplexity.ai" in url:
+                    return 0
+                if "perplexity" in title:
+                    return 1
+                return 2
 
-        ws_url = chosen.get("webSocketDebuggerUrl")
-        if not ws_url:
-            raise RuntimeError("No webSocketDebuggerUrl en el target seleccionado.")
+            page_targets.sort(key=score)
 
-        try:
-            self.cdp.connect(ws_url)
-        except Exception as e:
-            msg = str(e)
-            looks_like_allow_origins = (
-                "Handshake status 403" in msg
-                or "403 Forbidden" in msg
-                or "Rejected an incoming WebSocket connection" in msg
-                or "remote-allow-origins" in msg
-            )
-            if looks_like_allow_origins and self.cfg.restart_if_no_debug_port and self.cfg.auto_launch:
-                # Comet was started without --remote-allow-origins, restart with required flag.
-                self.start_comet(force_restart=True)
-                targets = self.list_targets()
-                page_targets = [t for t in targets if t.get("type") == "page"]
-                perplexity = next((t for t in page_targets if "perplexity.ai" in (t.get("url") or "")), None)
-                chosen = perplexity or (page_targets[0] if page_targets else self.new_tab(self.cfg.perplexity_url))
+            def has_assistant_input() -> bool:
+                try:
+                    return bool(
+                        self._eval(
+                            """
+                            (() => {
+                              const isAssistantField = (el) => {
+                                if (!el) return false;
+                                const ph = (el.getAttribute('placeholder') || '').toLowerCase();
+                                const aria = (el.getAttribute('aria-label') || '').toLowerCase();
+                                const role = (el.getAttribute('role') || '').toLowerCase();
+                                const cls = (el.className || '').toLowerCase();
+                                const hint = (ph + ' ' + aria + ' ' + role + ' ' + cls);
+                                if (el.getAttribute('contenteditable') === 'true') {
+                                  const url = (window.location && window.location.href) ? window.location.href.toLowerCase() : '';
+                                  if (url.includes('perplexity.ai')) return true;
+                                  try {
+                                    const r = el.getBoundingClientRect();
+                                    if (r.left > window.innerWidth * 0.18) return true;
+                                  } catch {}
+                                  return false;
+                                }
+                                return /(ask|pregunt|message|follow|seguimiento|solicitar|qué quieres saber|ask anything|type a message|add details)/i.test(hint);
+                              };
+                              const candidates = [...document.querySelectorAll('[contenteditable="true"], textarea, input[type="text"]')];
+                              for (const el of candidates) {
+                                if (!isAssistantField(el)) continue;
+                                const r = el.getBoundingClientRect();
+                                const style = window.getComputedStyle(el);
+                                const visible = r.width > 0 && r.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+                                if (visible) return true;
+                              }
+                              return false;
+                            })()
+                            """,
+                            timeout_s=4,
+                        )
+                    )
+                except Exception:
+                    return False
+
+            for chosen in page_targets[:10]:
                 ws_url = chosen.get("webSocketDebuggerUrl")
                 if not ws_url:
-                    raise RuntimeError("No webSocketDebuggerUrl en el target seleccionado tras reinicio.") from e
-                self.cdp.connect(ws_url)
-                self._active_target_id = chosen.get("id")
-            else:
-                raise
-        for method in ["Page.enable", "Runtime.enable", "DOM.enable", "Network.enable"]:
-            try:
-                self.cdp.call(method, timeout_s=10)
-            except CDPError:
-                pass
+                    continue
 
-        self._active_target_id = chosen.get("id")
-        self.ensure_perplexity_ready(fresh=False)
+                try:
+                    self.cdp.connect(ws_url)
+                except Exception as e:
+                    msg = str(e)
+                    looks_like_allow_origins = (
+                        "Handshake status 403" in msg
+                        or "403 Forbidden" in msg
+                        or "Rejected an incoming WebSocket connection" in msg
+                        or "remote-allow-origins" in msg
+                    )
+                    if looks_like_allow_origins and not restarted and self.cfg.restart_if_no_debug_port and self.cfg.auto_launch:
+                        # Comet was started without --remote-allow-origins, restart with required flag and rescan.
+                        restarted = True
+                        self.start_comet(force_restart=True)
+                        break
+                    raise
+
+                for method in ["Page.enable", "Runtime.enable", "DOM.enable", "Network.enable"]:
+                    try:
+                        self.cdp.call(method, timeout_s=10)
+                    except CDPError:
+                        pass
+
+                self._active_target_id = chosen.get("id")
+                if has_assistant_input():
+                    return
+
+            else:
+                # No tab had an assistant input; fall back to current tab and navigate as needed.
+                self._active_target_id = page_targets[0].get("id")
+                self.ensure_perplexity_ready(fresh=False)
+                return
+
+            # We broke out due to restart; retry the outer loop to refresh targets.
+            if restarted:
+                continue
 
     def ensure_connected(self) -> None:
         try:
@@ -199,87 +256,123 @@ class CometController:
     def ensure_perplexity_ready(self, fresh: bool) -> None:
         self.ensure_connected()
 
-        # Ensure we're on Perplexity
-        try:
-            url = str(self._eval("window.location.href", timeout_s=5) or "")
-        except Exception:
-            url = ""
+        def wait_for_assistant_input(timeout_s: float) -> dict[str, Any]:
+            deadline = time.time() + timeout_s
+            last_info: dict[str, Any] = {}
+            while time.time() < deadline:
+                info = self._eval(
+                    """
+                    (() => {
+                      const url = window.location.href;
+                      const ready = document.readyState;
+                      const isAssistantField = (el) => {
+                        if (!el) return false;
+                        const ph = (el.getAttribute('placeholder') || '').toLowerCase();
+                        const aria = (el.getAttribute('aria-label') || '').toLowerCase();
+                        const role = (el.getAttribute('role') || '').toLowerCase();
+                        const cls = (el.className || '').toLowerCase();
+                        const hint = (ph + ' ' + aria + ' ' + role + ' ' + cls);
+                        if (el.getAttribute('contenteditable') === 'true') {
+                          const url = (window.location && window.location.href) ? window.location.href.toLowerCase() : '';
+                          if (url.includes('perplexity.ai')) return true;
+                          try {
+                            const r = el.getBoundingClientRect();
+                            if (r.left > window.innerWidth * 0.18) return true;
+                          } catch {}
+                          return false;
+                        }
+                        // Avoid generic page inputs by requiring assistant-like hints
+                        return /(ask|pregunt|message|follow|seguimiento|solicitar|qué quieres saber|ask anything|type a message|add details)/i.test(hint);
+                      };
+
+                      const candidates = [...document.querySelectorAll('[contenteditable="true"], textarea, input[type="text"]')];
+                      let visible = false;
+                      let hint = '';
+                      let inputSel = '';
+                      for (const el of candidates) {
+                        if (!isAssistantField(el)) continue;
+                        const r = el.getBoundingClientRect();
+                        const style = window.getComputedStyle(el);
+                        const isVisible = r.width > 0 && r.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+                        if (!isVisible) continue;
+                        visible = true;
+                        inputSel = el.getAttribute('contenteditable') === 'true' ? '[contenteditable="true"]' : (el.tagName || '').toLowerCase();
+                        hint = (el.getAttribute('placeholder') || el.getAttribute('aria-label') || '').toString();
+                        break;
+                      }
+                      return { url, ready, found: visible, inputSel, hint };
+                    })()
+                    """,
+                    timeout_s=5,
+                )
+                if isinstance(info, dict):
+                    last_info = info
+                    if info.get("found"):
+                        return info
+                time.sleep(0.35)
+            return last_info
+
         if fresh:
-            # For "new chat", always go back to Perplexity home to reset UI state.
-            self.navigate(self.cfg.perplexity_url, wait_for_load=True)
-        elif "perplexity.ai" not in url:
+            # For "new chat", go to Perplexity home to reset UI state.
             self.navigate(self.cfg.perplexity_url, wait_for_load=True)
 
-        # Wait until an input is present and visible
-        deadline = time.time() + 20
-        last_info = ""
-        while time.time() < deadline:
-            info = self._eval(
-                """
-                (() => {
-                  const url = window.location.href;
-                  const ready = document.readyState;
-                  const selectors = [
-                    '[contenteditable="true"]',
-                    'textarea[placeholder*="Ask"]',
-                    'textarea[placeholder*="Search"]',
-                    'textarea[placeholder*="¿Qué"]',
-                    'textarea',
-                    'input[type="text"]'
-                  ];
-                  let sel = null;
-                  let visible = false;
-                  for (const s of selectors) {
-                    const el = document.querySelector(s);
-                    if (!el) continue;
-                    const r = el.getBoundingClientRect();
-                    const style = window.getComputedStyle(el);
-                    const isVisible = r.width > 0 && r.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
-                    if (isVisible) { sel = s; visible = true; break; }
-                  }
-                  return { url, ready, sel, visible };
-                })()
-                """,
-                timeout_s=5,
-            )
-            if isinstance(info, dict):
-                last_info = json.dumps(info, ensure_ascii=False)
-                if info.get("visible") and info.get("sel"):
-                    break
-            time.sleep(0.5)
-        else:
+        info = wait_for_assistant_input(timeout_s=10)
+        if not info.get("found"):
+            # If assistant input isn't available on this page, use Perplexity home.
+            self.navigate(self.cfg.perplexity_url, wait_for_load=True)
+            info = wait_for_assistant_input(timeout_s=12)
+
+        if not info.get("found"):
             # Try a fresh tab as last resort
             t = self.new_tab(self.cfg.perplexity_url)
             ws_url = t.get("webSocketDebuggerUrl")
             if not ws_url:
-                raise RuntimeError(f"No pude encontrar el input de Perplexity. Estado: {last_info}")
+                raise RuntimeError(f"No pude encontrar el input del asistente. Estado: {json.dumps(info, ensure_ascii=False)}")
             self.cdp.connect(ws_url)
             for method in ["Page.enable", "Runtime.enable", "DOM.enable", "Network.enable"]:
                 try:
                     self.cdp.call(method, timeout_s=10)
                 except CDPError:
                     pass
+            info = wait_for_assistant_input(timeout_s=10)
+            if not info.get("found"):
+                raise RuntimeError(f"No pude encontrar el input del asistente. Estado: {json.dumps(info, ensure_ascii=False)}")
 
         if fresh:
-            # Clear any residual text in the input
+            # Clear any residual text in the assistant input
             self._eval(
                 """
                 (() => {
-                  const el = document.querySelector('[contenteditable="true"]');
-                  if (el) {
-                    el.focus();
+                  const isAssistantField = (el) => {
+                    if (!el) return false;
+                    const ph = (el.getAttribute('placeholder') || '').toLowerCase();
+                    const aria = (el.getAttribute('aria-label') || '').toLowerCase();
+                    const role = (el.getAttribute('role') || '').toLowerCase();
+                    const cls = (el.className || '').toLowerCase();
+                    const hint = (ph + ' ' + aria + ' ' + role + ' ' + cls);
+                    if (el.getAttribute('contenteditable') === 'true') {
+                      const url = (window.location && window.location.href) ? window.location.href.toLowerCase() : '';
+                      if (url.includes('perplexity.ai')) return true;
+                      try {
+                        const r = el.getBoundingClientRect();
+                        if (r.left > window.innerWidth * 0.18) return true;
+                      } catch {}
+                      return false;
+                    }
+                    return /(ask|pregunt|message|follow|seguimiento|solicitar|qué quieres saber|ask anything|type a message|add details)/i.test(hint);
+                  };
+                  const candidates = [...document.querySelectorAll('[contenteditable="true"], textarea, input[type="text"]')];
+                  const target = candidates.find(isAssistantField);
+                  if (!target) return false;
+                  target.focus();
+                  if (target.getAttribute && target.getAttribute('contenteditable') === 'true') {
                     document.execCommand('selectAll', false, null);
                     document.execCommand('insertText', false, '');
                     return true;
                   }
-                  const ta = document.querySelector('textarea') || document.querySelector('input[type="text"]');
-                  if (ta) {
-                    ta.focus();
-                    ta.value = '';
-                    ta.dispatchEvent(new Event('input', { bubbles: true }));
-                    return true;
-                  }
-                  return false;
+                  target.value = '';
+                  target.dispatchEvent(new Event('input', { bubbles: true }));
+                  return true;
                 })()
                 """,
                 timeout_s=5,
@@ -331,78 +424,98 @@ class CometController:
         self.ensure_connected()
         prompt_json = json.dumps(prompt)
         typed = self._eval(
-            f"""
-            (() => {{
-              const prompt = {prompt_json};
-              const selectors = [
-                '[contenteditable="true"]',
-                'textarea[placeholder*="Ask"]',
-                'textarea[placeholder*="Search"]',
-                'textarea[placeholder*="¿Qué"]',
-                'textarea',
-                'input[type="text"]'
-              ];
-              let target = null;
-              for (const s of selectors) {{
-                const el = document.querySelector(s);
-                if (!el) continue;
+            """
+            (() => {
+              const prompt = PROMPT_JSON;
+              const isAssistantField = (el) => {
+                if (!el) return false;
+                const ph = (el.getAttribute('placeholder') || '').toLowerCase();
+                const aria = (el.getAttribute('aria-label') || '').toLowerCase();
+                const role = (el.getAttribute('role') || '').toLowerCase();
+                const cls = (el.className || '').toLowerCase();
+                const hint = (ph + ' ' + aria + ' ' + role + ' ' + cls);
+                if (el.getAttribute('contenteditable') === 'true') {
+                  const url = (window.location && window.location.href) ? window.location.href.toLowerCase() : '';
+                  if (url.includes('perplexity.ai')) return true;
+                  try {
+                    const r = el.getBoundingClientRect();
+                    if (r.left > window.innerWidth * 0.18) return true;
+                  } catch {}
+                  return false;
+                }
+                return /(ask|pregunt|message|follow|seguimiento|solicitar|qué quieres saber|ask anything|type a message|add details)/i.test(hint);
+              };
+
+              const candidates = [...document.querySelectorAll('[contenteditable="true"], textarea, input[type="text"]')];
+              const target = candidates.find(el => {
+                if (!isAssistantField(el)) return false;
                 const r = el.getBoundingClientRect();
-                if (r.width <= 0 || r.height <= 0) continue;
-                target = el;
-                break;
-              }}
-              if (!target) return {{ ok: false, reason: 'no input' }};
+                const style = window.getComputedStyle(el);
+                const visible = r.width > 0 && r.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+                return visible;
+              });
+              if (!target) return { ok: false, reason: 'no assistant input' };
 
               target.focus();
 
               // Prefer execCommand for contenteditable (works with React/Vue), fallback to direct assignment + input event
-              if (target.getAttribute && target.getAttribute('contenteditable') === 'true') {{
-                try {{
+              if (target.getAttribute && target.getAttribute('contenteditable') === 'true') {
+                try {
                   document.execCommand('selectAll', false, null);
                   document.execCommand('insertText', false, prompt);
-                }} catch {{
+                } catch {
                   target.innerText = '';
                   target.innerText = prompt;
-                  target.dispatchEvent(new InputEvent('input', {{ bubbles: true, inputType: 'insertText', data: prompt }}));
-                }}
-              }} else {{
+                  target.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: prompt }));
+                }
+              } else {
                 target.value = prompt;
-                target.dispatchEvent(new Event('input', {{ bubbles: true }}));
-              }}
+                target.dispatchEvent(new Event('input', { bubbles: true }));
+              }
 
               // Verify content exists
-              const hasText = (() => {{
-                const ce = document.querySelector('[contenteditable="true"]');
-                if (ce && ce.innerText && ce.innerText.trim().length > 0) return true;
-                const ta = document.querySelector('textarea');
-                if (ta && ta.value && ta.value.trim().length > 0) return true;
-                const it = document.querySelector('input[type="text"]');
-                if (it && it.value && it.value.trim().length > 0) return true;
-                return false;
-              }})();
-              return {{ ok: hasText }};
-            }})()
-            """,
+              const content = (target.getAttribute && target.getAttribute('contenteditable') === 'true')
+                ? (target.innerText || '')
+                : (target.value || '');
+              return { ok: (content.trim().length > 0), len: content.trim().length };
+            })()
+            """.replace("PROMPT_JSON", prompt_json),
             timeout_s=10,
         )
-        if typed is not True:
-            if isinstance(typed, dict) and typed.get("ok") is True:
-                pass
-            else:
-                raise RuntimeError("No se encontró input para escribir el prompt. ¿Estás en Perplexity?")
+        if not (isinstance(typed, dict) and typed.get("ok") is True):
+            raise RuntimeError("No se encontró el input del asistente para escribir el prompt. ¿Está abierto el panel de Perplexity/Asistente?")
 
-        time.sleep(0.3)
+        time.sleep(0.6)
         self._eval(
             """
             (() => {
-              const el = document.querySelector('[contenteditable="true"]') ||
-                         document.querySelector('textarea') ||
-                         document.querySelector('input[type="text"]');
+              const isAssistantField = (el) => {
+                if (!el) return false;
+                const ph = (el.getAttribute('placeholder') || '').toLowerCase();
+                const aria = (el.getAttribute('aria-label') || '').toLowerCase();
+                const role = (el.getAttribute('role') || '').toLowerCase();
+                const cls = (el.className || '').toLowerCase();
+                const hint = (ph + ' ' + aria + ' ' + role + ' ' + cls);
+                if (el.getAttribute('contenteditable') === 'true') {
+                  const url = (window.location && window.location.href) ? window.location.href.toLowerCase() : '';
+                  if (url.includes('perplexity.ai')) return true;
+                  try {
+                    const r = el.getBoundingClientRect();
+                    if (r.left > window.innerWidth * 0.18) return true;
+                  } catch {}
+                  return false;
+                }
+                return /(ask|pregunt|message|follow|seguimiento|solicitar|qué quieres saber|ask anything|type a message|add details)/i.test(hint);
+              };
+              const els = [...document.querySelectorAll('[contenteditable="true"], textarea, input[type="text"]')];
+              const el = els.find(isAssistantField);
               if (!el) return false;
               el.focus();
               const down = new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true });
+              const press = new KeyboardEvent('keypress', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true });
+              const up = new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true });
               el.dispatchEvent(down);
-              const up = new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true });
+              el.dispatchEvent(press);
               el.dispatchEvent(up);
               return true;
             })()
@@ -410,15 +523,41 @@ class CometController:
             timeout_s=5,
         )
 
-        time.sleep(0.8)
+        time.sleep(0.9)
         submitted = self._eval(
             """
             (() => {
-              const el = document.querySelector('[contenteditable="true"]');
-              if (el && el.innerText.trim().length < 5) return true;
-              const hasLoading = document.querySelector('[class*="animate-spin"], [class*="animate-pulse"]') !== null;
-              const hasThinking = document.body && document.body.innerText.includes('Thinking');
-              return hasLoading || hasThinking;
+              const hasLoading = document.querySelector('[class*="animate-spin"], [class*="animate-pulse"], [class*="loading"], [class*="thinking"]') !== null;
+              const body = document.body ? document.body.innerText : '';
+              const hasThinking = body.includes('Thinking') || body.includes('Pensando');
+              const isAssistantField = (el) => {
+                if (!el) return false;
+                const ph = (el.getAttribute('placeholder') || '').toLowerCase();
+                const aria = (el.getAttribute('aria-label') || '').toLowerCase();
+                const role = (el.getAttribute('role') || '').toLowerCase();
+                const cls = (el.className || '').toLowerCase();
+                const hint = (ph + ' ' + aria + ' ' + role + ' ' + cls);
+                if (el.getAttribute('contenteditable') === 'true') {
+                  const url = (window.location && window.location.href) ? window.location.href.toLowerCase() : '';
+                  if (url.includes('perplexity.ai')) return true;
+                  try {
+                    const r = el.getBoundingClientRect();
+                    if (r.left > window.innerWidth * 0.18) return true;
+                  } catch {}
+                  return false;
+                }
+                return /(ask|pregunt|message|follow|seguimiento|solicitar|qué quieres saber|ask anything|type a message|add details)/i.test(hint);
+              };
+              const els = [...document.querySelectorAll('[contenteditable="true"], textarea, input[type="text"]')];
+              const el = els.find(isAssistantField);
+              let cleared = false;
+              if (el) {
+                const content = (el.getAttribute && el.getAttribute('contenteditable') === 'true')
+                  ? (el.innerText || '')
+                  : (el.value || '');
+                cleared = content.trim().length < 2;
+              }
+              return cleared || hasLoading || hasThinking;
             })()
             """
         )
@@ -472,21 +611,36 @@ class CometController:
             })()
             """
         )
-        if not clicked:
-            # Last resort: try dispatching a submit event
-            self._eval(
+        if clicked:
+            time.sleep(0.7)
+            second = self._eval(
                 """
                 (() => {
-                  const form = document.querySelector('form');
-                  if (form) {
-                    form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
-                    return true;
-                  }
-                  return false;
+                  const hasLoading = document.querySelector('[class*="animate-spin"], [class*="animate-pulse"], [class*="loading"], [class*="thinking"]') !== null;
+                  const body = document.body ? document.body.innerText : '';
+                  const hasThinking = body.includes('Thinking') || body.includes('Pensando');
+                  return hasLoading || hasThinking;
                 })()
                 """,
                 timeout_s=5,
             )
+            if second:
+                return
+
+        # Last resort: try dispatching a submit event
+        self._eval(
+            """
+            (() => {
+              const form = document.querySelector('form');
+              if (form) {
+                form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+                return true;
+              }
+              return false;
+            })()
+            """,
+            timeout_s=5,
+        )
 
     def get_agent_status(self) -> AgentStatus:
         self.ensure_connected()
@@ -498,25 +652,35 @@ class CometController:
               const pageTitle = document.title || '';
 
               // Find the currently visible input (works for perplexity.ai and Comet sidebar assistant)
-              const selectors = [
-                '[contenteditable="true"]',
-                'textarea[placeholder*="Ask"]',
-                'textarea[placeholder*="Search"]',
-                'textarea[placeholder*="¿Qué"]',
-                'textarea',
-                'input[type="text"]'
-              ];
               let inputEl = null;
               let inputSel = '';
-              for (const s of selectors) {
-                const el = document.querySelector(s);
-                if (!el) continue;
+              const isAssistantField = (el) => {
+                if (!el) return false;
+                const ph = (el.getAttribute('placeholder') || '').toLowerCase();
+                const aria = (el.getAttribute('aria-label') || '').toLowerCase();
+                const role = (el.getAttribute('role') || '').toLowerCase();
+                const cls = (el.className || '').toLowerCase();
+                const hint = (ph + ' ' + aria + ' ' + role + ' ' + cls);
+                if (el.getAttribute('contenteditable') === 'true') {
+                  const url = (window.location && window.location.href) ? window.location.href.toLowerCase() : '';
+                  if (url.includes('perplexity.ai')) return true;
+                  try {
+                    const r = el.getBoundingClientRect();
+                    if (r.left > window.innerWidth * 0.18) return true;
+                  } catch {}
+                  return false;
+                }
+                return /(ask|pregunt|message|follow|seguimiento|solicitar|qué quieres saber|ask anything|type a message|add details)/i.test(hint);
+              };
+              const candidates = [...document.querySelectorAll('[contenteditable="true"], textarea, input[type="text"]')];
+              for (const el of candidates) {
+                if (!isAssistantField(el)) continue;
                 const r = el.getBoundingClientRect();
                 const style = window.getComputedStyle(el);
                 const visible = r.width > 0 && r.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
                 if (!visible) continue;
                 inputEl = el;
-                inputSel = s;
+                inputSel = (el.getAttribute('contenteditable') === 'true') ? '[contenteditable="true"]' : (el.tagName || '').toLowerCase();
                 break;
               }
 
@@ -525,22 +689,21 @@ class CometController:
               let extractor = 'body';
               if (inputEl && inputEl.parentElement) {
                 let node = inputEl;
+                let lastPanel = null;
                 for (let i = 0; i < 10 && node; i++) {
                   node = node.parentElement;
                   if (!node) break;
-                  const t = (node.innerText || '').toLowerCase();
-                  const looksLikePerplexityUi =
-                    (t.includes('perplexity') && (t.includes('asistente') || t.includes('ask') || t.includes('enlaces') || t.includes('links') || t.includes('imágenes') || t.includes('images'))) ||
-                    (t.includes('asistente') && (t.includes('enlaces') || t.includes('links') || t.includes('imágenes') || t.includes('images'))) ||
-                    t.includes('ask anything') ||
-                    t.includes('type a message') ||
-                    t.includes('preguntar algo') ||
-                    t.includes('escribe un mensaje');
-                  if (looksLikePerplexityUi) {
-                    root = node;
-                    extractor = 'assistant';
-                    break;
-                  }
+                  const rect = node.getBoundingClientRect();
+                  const isPanelLike =
+                    rect.height > window.innerHeight * 0.45 &&
+                    rect.width > 260 &&
+                    rect.width < window.innerWidth * 0.98 &&
+                    rect.left > window.innerWidth * 0.18;
+                  if (isPanelLike) lastPanel = node;
+                }
+                if (lastPanel) {
+                  root = lastPanel;
+                  extractor = 'panel';
                 }
               }
               if (!root) {
@@ -879,18 +1042,34 @@ class CometController:
             baseline_tail=baseline.debug_tail,
         )
 
-        self.send_prompt(prompt)
+        try:
+            self.send_prompt(prompt)
+        except Exception as e:
+            msg = str(e)
+            recoverable = (
+                "No se encontró el input del asistente" in msg
+                or "panel de Perplexity" in msg
+                or "posible fallo al enviar" in msg
+            )
+            if recoverable:
+                self._debug("send_retry", error=msg)
+                self.connect_best_tab()
+                self.ensure_perplexity_ready(fresh=False)
+                self.send_prompt(prompt)
+            else:
+                raise
 
         deadline = time.time() + timeout_s
         sent_at = time.time()
         last_activity = time.time()
-        prev_response = ""
+        prev_response = baseline_response
         saw_response = False
         done_candidate_at: float | None = None
         done_candidate_response: str = ""
         grace_s = 3.0
         seen_working = False
         resubmit_attempted = False
+        reconnect_attempted = False
         last_debug_at = 0.0
         last_debug_resp_len = -1
 
@@ -986,6 +1165,17 @@ class CometController:
                 except Exception:
                     pass
                 resubmit_attempted = True
+
+            # If we're stuck (no new response, no loading), try reconnecting once (often wrong tab on first connect).
+            if not reconnect_attempted and not saw_response and not seen_working and (time.time() - sent_at) > 15:
+                reconnect_attempted = True
+                self._debug("reconnect", reason="no_progress_15s")
+                try:
+                    self.connect_best_tab()
+                    # Do not force fresh; just ensure input exists on the chosen tab/page.
+                    self.ensure_perplexity_ready(fresh=False)
+                except Exception as e:
+                    self._debug("reconnect_failed", error=str(e))
 
             idle_s = now - last_activity
 

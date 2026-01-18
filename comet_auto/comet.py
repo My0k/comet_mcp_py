@@ -26,6 +26,9 @@ class AgentStatus:
     has_stop_button: bool
     has_loading: bool
     has_followup_ui: bool
+    error_type: str
+    error_text: str
+    has_retry_button: bool
     is_stable: bool
 
 
@@ -54,6 +57,11 @@ def _default_comet_paths() -> list[str]:
         r"C:\Program Files (x86)\Perplexity\Comet\Application\comet.exe",
     ]
     return [p for p in candidates if p and Path(p).exists()]
+
+
+def _is_internal_url(url: str) -> bool:
+    u = (url or "").lower().strip()
+    return u.startswith(("chrome://", "edge://", "devtools://", "about:", "chrome-extension://"))
 
 
 class CometController:
@@ -130,7 +138,7 @@ class CometController:
         self.start_comet()
         targets = self.list_targets()
 
-        page_targets = [t for t in targets if t.get("type") == "page"]
+        page_targets = [t for t in targets if t.get("type") == "page" and not _is_internal_url(str(t.get("url") or ""))]
         if not page_targets:
             t = self.new_tab(self.cfg.perplexity_url)
             page_targets = [t]
@@ -166,22 +174,106 @@ class CometController:
                 self._active_target_id = chosen.get("id")
             else:
                 raise
-        self._active_target_id = chosen.get("id")
-
         for method in ["Page.enable", "Runtime.enable", "DOM.enable", "Network.enable"]:
             try:
                 self.cdp.call(method, timeout_s=10)
             except CDPError:
                 pass
 
-        if "perplexity.ai" not in (chosen.get("url") or ""):
-            self.navigate(self.cfg.perplexity_url, wait_for_load=True)
+        self._active_target_id = chosen.get("id")
+        self.ensure_perplexity_ready(fresh=False)
 
     def ensure_connected(self) -> None:
         try:
             self.cdp.call("Runtime.evaluate", {"expression": "1+1", "returnByValue": True}, timeout_s=3)
         except Exception:
             self.connect_best_tab()
+
+    def ensure_perplexity_ready(self, fresh: bool) -> None:
+        self.ensure_connected()
+
+        # Ensure we're on Perplexity
+        try:
+            url = str(self._eval("window.location.href", timeout_s=5) or "")
+        except Exception:
+            url = ""
+        if "perplexity.ai" not in url:
+            self.navigate(self.cfg.perplexity_url, wait_for_load=True)
+
+        # Wait until an input is present and visible
+        deadline = time.time() + 20
+        last_info = ""
+        while time.time() < deadline:
+            info = self._eval(
+                """
+                (() => {
+                  const url = window.location.href;
+                  const ready = document.readyState;
+                  const selectors = [
+                    '[contenteditable="true"]',
+                    'textarea[placeholder*="Ask"]',
+                    'textarea[placeholder*="Search"]',
+                    'textarea[placeholder*="¿Qué"]',
+                    'textarea',
+                    'input[type="text"]'
+                  ];
+                  let sel = null;
+                  let visible = false;
+                  for (const s of selectors) {
+                    const el = document.querySelector(s);
+                    if (!el) continue;
+                    const r = el.getBoundingClientRect();
+                    const style = window.getComputedStyle(el);
+                    const isVisible = r.width > 0 && r.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+                    if (isVisible) { sel = s; visible = true; break; }
+                  }
+                  return { url, ready, sel, visible };
+                })()
+                """,
+                timeout_s=5,
+            )
+            if isinstance(info, dict):
+                last_info = json.dumps(info, ensure_ascii=False)
+                if info.get("visible") and info.get("sel"):
+                    break
+            time.sleep(0.5)
+        else:
+            # Try a fresh tab as last resort
+            t = self.new_tab(self.cfg.perplexity_url)
+            ws_url = t.get("webSocketDebuggerUrl")
+            if not ws_url:
+                raise RuntimeError(f"No pude encontrar el input de Perplexity. Estado: {last_info}")
+            self.cdp.connect(ws_url)
+            for method in ["Page.enable", "Runtime.enable", "DOM.enable", "Network.enable"]:
+                try:
+                    self.cdp.call(method, timeout_s=10)
+                except CDPError:
+                    pass
+
+        if fresh:
+            # Clear any residual text in the input
+            self._eval(
+                """
+                (() => {
+                  const el = document.querySelector('[contenteditable="true"]');
+                  if (el) {
+                    el.focus();
+                    document.execCommand('selectAll', false, null);
+                    document.execCommand('insertText', false, '');
+                    return true;
+                  }
+                  const ta = document.querySelector('textarea') || document.querySelector('input[type="text"]');
+                  if (ta) {
+                    ta.focus();
+                    ta.value = '';
+                    ta.dispatchEvent(new Event('input', { bubbles: true }));
+                    return true;
+                  }
+                  return false;
+                })()
+                """,
+                timeout_s=5,
+            )
 
     def navigate(self, url: str, wait_for_load: bool = True) -> None:
         self.ensure_connected()
@@ -217,45 +309,85 @@ class CometController:
 
     def send_prompt(self, prompt: str) -> None:
         self.ensure_connected()
+        prompt_json = json.dumps(prompt)
         typed = self._eval(
             f"""
             (() => {{
-              const prompt = {json.dumps(prompt)};
-              const el = document.querySelector('[contenteditable="true"]');
-              if (el) {{
-                el.focus();
-                document.execCommand('selectAll', false, null);
-                document.execCommand('insertText', false, prompt);
-                return true;
+              const prompt = {prompt_json};
+              const selectors = [
+                '[contenteditable="true"]',
+                'textarea[placeholder*="Ask"]',
+                'textarea[placeholder*="Search"]',
+                'textarea[placeholder*="¿Qué"]',
+                'textarea',
+                'input[type="text"]'
+              ];
+              let target = null;
+              for (const s of selectors) {{
+                const el = document.querySelector(s);
+                if (!el) continue;
+                const r = el.getBoundingClientRect();
+                if (r.width <= 0 || r.height <= 0) continue;
+                target = el;
+                break;
               }}
-              const ta = document.querySelector('textarea');
-              if (ta) {{
-                ta.focus();
-                ta.value = prompt;
-                ta.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                return true;
+              if (!target) return {{ ok: false, reason: 'no input' }};
+
+              target.focus();
+
+              // Prefer execCommand for contenteditable (works with React/Vue), fallback to direct assignment + input event
+              if (target.getAttribute && target.getAttribute('contenteditable') === 'true') {{
+                try {{
+                  document.execCommand('selectAll', false, null);
+                  document.execCommand('insertText', false, prompt);
+                }} catch {{
+                  target.innerText = '';
+                  target.innerText = prompt;
+                  target.dispatchEvent(new InputEvent('input', {{ bubbles: true, inputType: 'insertText', data: prompt }}));
+                }}
+              }} else {{
+                target.value = prompt;
+                target.dispatchEvent(new Event('input', {{ bubbles: true }}));
               }}
-              return false;
+
+              // Verify content exists
+              const hasText = (() => {{
+                const ce = document.querySelector('[contenteditable="true"]');
+                if (ce && ce.innerText && ce.innerText.trim().length > 0) return true;
+                const ta = document.querySelector('textarea');
+                if (ta && ta.value && ta.value.trim().length > 0) return true;
+                const it = document.querySelector('input[type="text"]');
+                if (it && it.value && it.value.trim().length > 0) return true;
+                return false;
+              }})();
+              return {{ ok: hasText }};
             }})()
-            """
+            """,
+            timeout_s=10,
         )
         if typed is not True:
-            raise RuntimeError("No se encontró input para escribir el prompt. ¿Estás en Perplexity?")
+            if isinstance(typed, dict) and typed.get("ok") is True:
+                pass
+            else:
+                raise RuntimeError("No se encontró input para escribir el prompt. ¿Estás en Perplexity?")
 
         time.sleep(0.3)
         self._eval(
             """
             (() => {
-              const el = document.querySelector('[contenteditable="true"]') || document.querySelector('textarea');
+              const el = document.querySelector('[contenteditable="true"]') ||
+                         document.querySelector('textarea') ||
+                         document.querySelector('input[type="text"]');
               if (!el) return false;
               el.focus();
-              const enterDown = new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true });
-              el.dispatchEvent(enterDown);
-              const enterUp = new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true });
-              el.dispatchEvent(enterUp);
+              const down = new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true });
+              el.dispatchEvent(down);
+              const up = new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true });
+              el.dispatchEvent(up);
               return true;
             })()
-            """
+            """,
+            timeout_s=5,
         )
 
         time.sleep(0.8)
@@ -289,12 +421,52 @@ class CometController:
                   return true;
                 }
               }
+              // Position-based fallback: rightmost visible button near input
+              const inputEl = document.querySelector('[contenteditable="true"]') ||
+                              document.querySelector('textarea') ||
+                              document.querySelector('input[type="text"]');
+              if (inputEl) {
+                let parent = inputEl.parentElement;
+                const candidates = [];
+                for (let i = 0; i < 6 && parent; i++) {
+                  for (const btn of parent.querySelectorAll('button')) {
+                    if (btn.disabled || btn.offsetParent === null) continue;
+                    const rect = btn.getBoundingClientRect();
+                    if (rect.width <= 0 || rect.height <= 0) continue;
+                    const aria = (btn.getAttribute('aria-label') || '').toLowerCase();
+                    const txt = (btn.innerText || '').toLowerCase();
+                    if (aria.includes('search') || aria.includes('research') || aria.includes('labs') || aria.includes('learn')) continue;
+                    if (aria.includes('attach') || aria.includes('voice') || aria.includes('menu') || aria.includes('more')) continue;
+                    if (txt.includes('attach') || txt.includes('voice')) continue;
+                    candidates.push({ btn, x: rect.right, y: rect.top });
+                  }
+                  parent = parent.parentElement;
+                }
+                if (candidates.length) {
+                  candidates.sort((a, b) => b.x - a.x);
+                  candidates[0].btn.click();
+                  return true;
+                }
+              }
               return false;
             })()
             """
         )
         if not clicked:
-            raise RuntimeError("No se pudo enviar el prompt (Enter/click fallaron).")
+            # Last resort: try dispatching a submit event
+            self._eval(
+                """
+                (() => {
+                  const form = document.querySelector('form');
+                  if (form) {
+                    form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+                    return true;
+                  }
+                  return false;
+                })()
+                """,
+                timeout_s=5,
+            )
 
     def get_agent_status(self) -> AgentStatus:
         self.ensure_connected()
@@ -303,6 +475,7 @@ class CometController:
             (() => {
               const bodyText = (document.body && document.body.innerText) ? document.body.innerText : '';
               const main = document.querySelector('main') || document.querySelector('[role="main"]') || document.body;
+              const mainText = (main && main.innerText) ? main.innerText : bodyText;
 
               let hasStop = false;
               for (const btn of document.querySelectorAll('button')) {
@@ -338,6 +511,30 @@ class CometController:
                 bodyText.includes('Añadir detalles') ||
                 bodyText.includes('Agregar detalles') ||
                 bodyText.includes('Pregunta de seguimiento');
+
+              // Detect "omitted" / error states
+              let errorType = '';
+              let errorText = '';
+              if (/respuesta omitida/i.test(mainText) || /response omitted/i.test(mainText)) {
+                errorType = 'omitted';
+                errorText = 'Respuesta omitida';
+              } else if (/something went wrong/i.test(mainText) || /network error/i.test(mainText) || /error/i.test(mainText) && /try again|retry/i.test(mainText)) {
+                errorType = 'retryable_error';
+                errorText = 'Error (reintentar)';
+              }
+
+              let hasRetryButton = false;
+              if (errorType) {
+                for (const btn of document.querySelectorAll('button')) {
+                  if (btn.offsetParent === null || btn.disabled) continue;
+                  const t = ((btn.innerText || '') + ' ' + (btn.getAttribute('aria-label') || '')).toLowerCase();
+                  if (t.includes('try again') || t.includes('retry') || t.includes('regenerate') ||
+                      t.includes('reintentar') || t.includes('intentar de nuevo') || t.includes('regenerar')) {
+                    hasRetryButton = true;
+                    break;
+                  }
+                }
+              }
 
               let status = 'idle';
               if (hasStop || hasLoading) status = 'working';
@@ -442,8 +639,8 @@ class CometController:
               }
 
               // Completion heuristic (signal-only; stability handled in Python loop)
-              if (!hasStop && !hasLoading && response && response.length > 120 && hasFollowup) status = 'completed';
-              return { status, steps, currentStep: steps.length ? steps[steps.length-1] : '', response, hasStopButton: hasStop, hasLoading, hasFollowup };
+              if (!errorType && !hasStop && !hasLoading && response && response.length > 120 && hasFollowup) status = 'completed';
+              return { status, steps, currentStep: steps.length ? steps[steps.length-1] : '', response, hasStopButton: hasStop, hasLoading, hasFollowup, errorType, errorText, hasRetryButton };
             })()
             """
         )
@@ -466,6 +663,9 @@ class CometController:
         has_stop = bool(payload.get("hasStopButton"))
         has_loading = bool(payload.get("hasLoading"))
         has_followup_ui = bool(payload.get("hasFollowup"))
+        error_type = str(payload.get("errorType") or "")
+        error_text = str(payload.get("errorText") or "")
+        has_retry_button = bool(payload.get("hasRetryButton"))
 
         return AgentStatus(
             status=status,
@@ -475,8 +675,35 @@ class CometController:
             has_stop_button=has_stop,
             has_loading=has_loading,
             has_followup_ui=has_followup_ui,
+            error_type=error_type,
+            error_text=error_text,
+            has_retry_button=has_retry_button,
             is_stable=is_stable,
         )
+
+    def click_retry(self) -> bool:
+        try:
+            return bool(
+                self._eval(
+                    """
+                    (() => {
+                      for (const btn of document.querySelectorAll('button')) {
+                        if (btn.offsetParent === null || btn.disabled) continue;
+                        const t = ((btn.innerText || '') + ' ' + (btn.getAttribute('aria-label') || '')).toLowerCase();
+                        if (t.includes('try again') || t.includes('retry') || t.includes('regenerate') ||
+                            t.includes('reintentar') || t.includes('intentar de nuevo') || t.includes('regenerar')) {
+                          btn.click();
+                          return true;
+                        }
+                      }
+                      return false;
+                    })()
+                    """,
+                    timeout_s=5,
+                )
+            )
+        except Exception:
+            return False
 
     def _normalize_prompt(self, prompt: str) -> str:
         # Similar to example_mcp_comet: collapse bullets/newlines for browser input reliability
@@ -518,10 +745,10 @@ class CometController:
         prompt = self._maybe_make_agentic(self._normalize_prompt(prompt))
 
         self.reset_stability()
-        self.ensure_connected()
+        self.ensure_perplexity_ready(fresh=new_chat)
         if new_chat:
-            self.navigate(self.cfg.perplexity_url, wait_for_load=True)
-            time.sleep(1.0)
+            # give the UI a moment to settle
+            time.sleep(0.8)
 
         self.send_prompt(prompt)
 
@@ -540,6 +767,19 @@ class CometController:
                 last_activity = time.time()
                 saw_response = True
                 done_candidate_at = None
+
+            # Handle omitted / retryable errors
+            if st.error_type:
+                if st.has_retry_button and self.click_retry():
+                    self.reset_stability()
+                    prev_response = ""
+                    saw_response = False
+                    done_candidate_at = None
+                    done_candidate_response = ""
+                    last_activity = time.time()
+                    time.sleep(1.0)
+                    continue
+                raise RuntimeError(f"Perplexity devolvió '{st.error_text or st.error_type}'.")
 
             now = time.time()
             idle_s = now - last_activity

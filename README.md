@@ -26,6 +26,11 @@ Si ves el error `Handshake status 403 Forbidden`, significa que Comet está corr
 
 Si Perplexity requiere login, inicia sesión manualmente en esa ventana de Comet y luego vuelve a la app.
 
+## Uso programático (texto)
+
+- CLI: `run_comet_auto_cli.bat "tu prompt"`
+- Debug (logs en stderr): `set COMET_AUTO_DEBUG=1` antes de ejecutar, o usa `--debug` en CLI.
+
 ## Notas de implementación
 
 - La lógica reutiliza el patrón de `example_mcp_comet`: conexión por CDP, `Runtime.evaluate` para escribir/enviar y *smart completion* por estabilidad de respuesta y presencia/ausencia de botón “Stop”.

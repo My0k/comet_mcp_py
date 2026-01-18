@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 import time
 import urllib.parse
 import urllib.request
@@ -29,6 +30,11 @@ class AgentStatus:
     error_type: str
     error_text: str
     has_retry_button: bool
+    page_url: str
+    page_title: str
+    extractor: str
+    debug_tail: str
+    input_selector: str
     is_stable: bool
 
 
@@ -72,6 +78,7 @@ class CometController:
         self._last_response_text = ""
         self._stable_count = 0
         self._stability_threshold = 3
+        self._debug_enabled = os.environ.get("COMET_AUTO_DEBUG", "").strip() not in ("", "0", "false", "False")
 
     @staticmethod
     def detect_comet_exe() -> str | None:
@@ -296,6 +303,16 @@ class CometController:
         )
         return result.get("result", {}).get("value")
 
+    def _debug(self, event: str, **fields: Any) -> None:
+        if not self._debug_enabled:
+            return
+        payload = {"event": event, **fields}
+        try:
+            print("[debug] " + json.dumps(payload, ensure_ascii=False), file=sys.stderr, flush=True)
+        except Exception:
+            # Never fail the main flow due to debug logging
+            pass
+
     def reset_stability(self) -> None:
         self._last_response_text = ""
         self._stable_count = 0
@@ -477,9 +494,62 @@ class CometController:
             """
             (() => {
               const bodyText = (document.body && document.body.innerText) ? document.body.innerText : '';
-              const main = document.querySelector('main') || document.querySelector('[role="main"]') || document.body;
-              const mainText = (main && main.innerText) ? main.innerText : bodyText;
-              const tailText = mainText.slice(-2500);
+              const pageUrl = window.location.href;
+              const pageTitle = document.title || '';
+
+              // Find the currently visible input (works for perplexity.ai and Comet sidebar assistant)
+              const selectors = [
+                '[contenteditable="true"]',
+                'textarea[placeholder*="Ask"]',
+                'textarea[placeholder*="Search"]',
+                'textarea[placeholder*="¿Qué"]',
+                'textarea',
+                'input[type="text"]'
+              ];
+              let inputEl = null;
+              let inputSel = '';
+              for (const s of selectors) {
+                const el = document.querySelector(s);
+                if (!el) continue;
+                const r = el.getBoundingClientRect();
+                const style = window.getComputedStyle(el);
+                const visible = r.width > 0 && r.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+                if (!visible) continue;
+                inputEl = el;
+                inputSel = s;
+                break;
+              }
+
+              // Try to locate the assistant "panel" root around the input (avoids reading the underlying page main content)
+              let root = null;
+              let extractor = 'body';
+              if (inputEl && inputEl.parentElement) {
+                let node = inputEl;
+                for (let i = 0; i < 10 && node; i++) {
+                  node = node.parentElement;
+                  if (!node) break;
+                  const t = (node.innerText || '').toLowerCase();
+                  const looksLikePerplexityUi =
+                    (t.includes('perplexity') && (t.includes('asistente') || t.includes('ask') || t.includes('enlaces') || t.includes('links') || t.includes('imágenes') || t.includes('images'))) ||
+                    (t.includes('asistente') && (t.includes('enlaces') || t.includes('links') || t.includes('imágenes') || t.includes('images'))) ||
+                    t.includes('ask anything') ||
+                    t.includes('type a message') ||
+                    t.includes('preguntar algo') ||
+                    t.includes('escribe un mensaje');
+                  if (looksLikePerplexityUi) {
+                    root = node;
+                    extractor = 'assistant';
+                    break;
+                  }
+                }
+              }
+              if (!root) {
+                root = document.querySelector('main') || document.querySelector('[role="main"]') || document.body;
+                extractor = root === document.body ? 'body' : 'main';
+              }
+
+              const scopeText = (root && root.innerText) ? root.innerText : bodyText;
+              const tailText = scopeText.slice(-3000);
 
               let hasStop = false;
               for (const btn of document.querySelectorAll('button')) {
@@ -557,11 +627,11 @@ class CometController:
               let response = '';
 
               // Strategy 1: Content after "X steps completed" marker (agentic final answer)
-              const stepsMatch = bodyText.match(/\\d+\\s+(steps?|pasos?)\\s+(completed|completad[oa]s?)/i);
+              const stepsMatch = scopeText.match(/\\d+\\s+(steps?|pasos?)\\s+(completed|completad[oa]s?)/i);
               if (stepsMatch) {
-                const markerIndex = bodyText.indexOf(stepsMatch[0]);
+                const markerIndex = scopeText.indexOf(stepsMatch[0]);
                 if (markerIndex !== -1) {
-                  let after = bodyText.substring(markerIndex + stepsMatch[0].length).trim();
+                  let after = scopeText.substring(markerIndex + stepsMatch[0].length).trim();
                   after = after.replace(/^[>›→\\s]+/, '').trim();
                   const endMarkers = [
                     'Ask anything', 'Ask a follow-up', 'Ask follow-up', 'Add details', 'Type a message',
@@ -578,11 +648,11 @@ class CometController:
 
               // Strategy 2: Content after "Reviewed X sources" marker
               if (!response || response.length < 80) {
-                const sourcesMatch = bodyText.match(/Reviewed\\s+\\d+\\s+sources?/i);
+                const sourcesMatch = scopeText.match(/Reviewed\\s+\\d+\\s+sources?/i);
                 if (sourcesMatch) {
-                  const markerIndex = bodyText.indexOf(sourcesMatch[0]);
+                  const markerIndex = scopeText.indexOf(sourcesMatch[0]);
                   if (markerIndex !== -1) {
-                    let after = bodyText.substring(markerIndex + sourcesMatch[0].length).trim();
+                    let after = scopeText.substring(markerIndex + sourcesMatch[0].length).trim();
                     const endMarkers = [
                       'Ask anything', 'Ask a follow-up', 'Ask follow-up', 'Add details', 'Type a message',
                       'Preguntar algo', 'Escribe un mensaje', 'Añadir detalles', 'Agregar detalles', 'Pregunta de seguimiento'
@@ -597,39 +667,44 @@ class CometController:
                 }
               }
 
-              // Strategy 3: Fallback to prose blocks
-              const selectors = [
-                '[class*="prose"]',
-                '[class*="Prose"]',
-                '[class*="markdown"]',
-                '[class*="Markdown"]',
-                '[data-testid*="answer"]',
-                '[class*="answer"]'
-              ];
-              const candidateEls = [];
-              for (const sel of selectors) {
-                try { candidateEls.push(...main.querySelectorAll(sel)); } catch {}
+              // Strategy 3: Capture recent content blocks above the input (works well for both perplexity.ai and sidebar UI)
+              if (!response || response.length < 120) {
+                const inputTop = inputEl ? inputEl.getBoundingClientRect().top : Infinity;
+                const blockSelectors = [
+                  '[class*="prose"]',
+                  '[class*="markdown"]',
+                  '[data-testid*="answer"]',
+                  '[data-testid*="message"]',
+                  'article',
+                  '[role="article"]'
+                ];
+                const blocks = [];
+                for (const sel of blockSelectors) {
+                  try { blocks.push(...root.querySelectorAll(sel)); } catch {}
+                }
+                const uniq = [...new Set(blocks)];
+                const candidates = [];
+                for (const el of uniq) {
+                  if (!el) continue;
+                  if (inputEl && el.contains && el.contains(inputEl)) continue;
+                  if (el.closest && el.closest('nav, header, footer')) continue;
+                  const r = el.getBoundingClientRect();
+                  if (r.width <= 0 || r.height <= 0) continue;
+                  if (r.bottom > inputTop - 6) continue; // below or overlapping input area
+                  const text = (el.innerText || '').trim();
+                  if (!text || text.length < 12) continue;
+                  // Skip UI-only small headers
+                  if (/^(perplexity|asistente|enlaces|imágenes|images|links)$/i.test(text)) continue;
+                  candidates.push({ text, top: r.top });
+                }
+                candidates.sort((a, b) => a.top - b.top);
+                const picked = candidates.slice(-10).map(x => x.text);
+                if (picked.length) response = picked.join('\\n\\n');
               }
 
-              const texts = [...new Set(candidateEls)]
-                .filter(el => {
-                  if (el.closest('nav, aside, header, footer, form, [contenteditable]')) return false;
-                  const t = (el.innerText || '').trim();
-                  if (!t) return false;
-                  const uiStarts = ['Library','Discover','Spaces','Finance','Account','Upgrade','Home','Search'];
-                  if (uiStarts.some(s => t.startsWith(s))) return false;
-                  return t.length > 10;
-                })
-                .map(el => el.innerText.trim());
-
-              if ((!response || response.length < 120) && texts.length > 0) {
-                // Take more blocks: answers often split headings + bullet lists
-                response = texts.slice(-12).join('\\n\\n');
-              }
-
-              // Strategy 4: As a last resort, use main text (trimmed)
-              if ((!response || response.length < 120) && main && main.innerText) {
-                response = main.innerText.trim();
+              // Strategy 4: Last resort, use scope text (trimmed)
+              if ((!response || response.length < 120) && scopeText) {
+                response = scopeText.trim();
               }
 
               // Clean response a bit (UI artifacts)
@@ -654,7 +729,23 @@ class CometController:
 
               // Completion heuristic (signal-only; stability handled in Python loop)
               if (!errorType && !hasStop && !hasLoading && response && response.length > 120 && hasFollowup) status = 'completed';
-              return { status, steps, currentStep: steps.length ? steps[steps.length-1] : '', response, hasStopButton: hasStop, hasLoading, hasFollowup, errorType, errorText, hasRetryButton };
+              return {
+                status,
+                steps,
+                currentStep: steps.length ? steps[steps.length-1] : '',
+                response,
+                hasStopButton: hasStop,
+                hasLoading,
+                hasFollowup,
+                errorType,
+                errorText,
+                hasRetryButton,
+                pageUrl,
+                pageTitle,
+                extractor,
+                debugTail: tailText.slice(-400),
+                inputSel
+              };
             })()
             """
         )
@@ -680,6 +771,11 @@ class CometController:
         error_type = str(payload.get("errorType") or "")
         error_text = str(payload.get("errorText") or "")
         has_retry_button = bool(payload.get("hasRetryButton"))
+        page_url = str(payload.get("pageUrl") or "")
+        page_title = str(payload.get("pageTitle") or "")
+        extractor = str(payload.get("extractor") or "")
+        debug_tail = str(payload.get("debugTail") or "")
+        input_selector = str(payload.get("inputSel") or "")
 
         return AgentStatus(
             status=status,
@@ -692,6 +788,11 @@ class CometController:
             error_type=error_type,
             error_text=error_text,
             has_retry_button=has_retry_button,
+            page_url=page_url,
+            page_title=page_title,
+            extractor=extractor,
+            debug_tail=debug_tail,
+            input_selector=input_selector,
             is_stable=is_stable,
         )
 
@@ -766,6 +867,17 @@ class CometController:
 
         baseline = self.get_agent_status()
         baseline_response = baseline.response
+        self._debug(
+            "send",
+            new_chat=new_chat,
+            prompt=prompt,
+            page_url=baseline.page_url,
+            page_title=baseline.page_title,
+            extractor=baseline.extractor,
+            input_selector=baseline.input_selector,
+            baseline_len=len(baseline.response or ""),
+            baseline_tail=baseline.debug_tail,
+        )
 
         self.send_prompt(prompt)
 
@@ -779,6 +891,8 @@ class CometController:
         grace_s = 3.0
         seen_working = False
         resubmit_attempted = False
+        last_debug_at = 0.0
+        last_debug_resp_len = -1
 
         while time.time() < deadline:
             st = self.get_agent_status()
@@ -790,6 +904,35 @@ class CometController:
                 last_activity = time.time()
                 saw_response = True
                 done_candidate_at = None
+                if self._debug_enabled:
+                    self._debug(
+                        "response_update",
+                        response_len=len(st.response or ""),
+                        response_tail=(st.response or "")[-400:],
+                        extractor=st.extractor,
+                        page_url=st.page_url,
+                    )
+
+            now = time.time()
+            if self._debug_enabled and (now - last_debug_at) >= 1.0:
+                resp_len = len(st.response or "")
+                if resp_len != last_debug_resp_len or st.status != "working" or st.error_type:
+                    self._debug(
+                        "poll",
+                        status=st.status,
+                        stop=st.has_stop_button,
+                        loading=st.has_loading,
+                        stable=st.is_stable,
+                        response_len=resp_len,
+                        extractor=st.extractor,
+                        input_selector=st.input_selector,
+                        error_type=st.error_type,
+                        page_url=st.page_url,
+                        page_title=st.page_title,
+                        tail=st.debug_tail,
+                    )
+                    last_debug_resp_len = resp_len
+                last_debug_at = now
 
             # Handle omitted / retryable errors
             should_consider_error = seen_working or saw_response or (st.response and st.response != baseline_response)
@@ -844,7 +987,6 @@ class CometController:
                     pass
                 resubmit_attempted = True
 
-            now = time.time()
             idle_s = now - last_activity
 
             # Candidate "done" conditions (don't return immediately; confirm with grace window)

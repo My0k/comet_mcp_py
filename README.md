@@ -29,3 +29,4 @@ Si Perplexity requiere login, inicia sesión manualmente en esa ventana de Comet
 ## Notas de implementación
 
 - La lógica reutiliza el patrón de `example_mcp_comet`: conexión por CDP, `Runtime.evaluate` para escribir/enviar y *smart completion* por estabilidad de respuesta y presencia/ausencia de botón “Stop”.
+- Si aparece `Respuesta omitida`, la app intenta reintentar (si existe botón “Reintentar/Regenerate”) solo cuando corresponde a la respuesta actual; si no hay actividad nueva, devuelve un error de “posible fallo al enviar”.

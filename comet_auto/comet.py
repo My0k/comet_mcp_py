@@ -197,7 +197,10 @@ class CometController:
             url = str(self._eval("window.location.href", timeout_s=5) or "")
         except Exception:
             url = ""
-        if "perplexity.ai" not in url:
+        if fresh:
+            # For "new chat", always go back to Perplexity home to reset UI state.
+            self.navigate(self.cfg.perplexity_url, wait_for_load=True)
+        elif "perplexity.ai" not in url:
             self.navigate(self.cfg.perplexity_url, wait_for_load=True)
 
         # Wait until an input is present and visible
@@ -476,6 +479,7 @@ class CometController:
               const bodyText = (document.body && document.body.innerText) ? document.body.innerText : '';
               const main = document.querySelector('main') || document.querySelector('[role="main"]') || document.body;
               const mainText = (main && main.innerText) ? main.innerText : bodyText;
+              const tailText = mainText.slice(-2500);
 
               let hasStop = false;
               for (const btn of document.querySelectorAll('button')) {
@@ -515,10 +519,20 @@ class CometController:
               // Detect "omitted" / error states
               let errorType = '';
               let errorText = '';
-              if (/respuesta omitida/i.test(mainText) || /response omitted/i.test(mainText)) {
+              // IMPORTANT: only look at the tail of the page so old errors don't trigger on new prompts.
+              if (
+                /respuesta omitida/i.test(tailText) ||
+                /response omitted/i.test(tailText) ||
+                /answer omitted/i.test(tailText) ||
+                /output omitted/i.test(tailText)
+              ) {
                 errorType = 'omitted';
                 errorText = 'Respuesta omitida';
-              } else if (/something went wrong/i.test(mainText) || /network error/i.test(mainText) || /error/i.test(mainText) && /try again|retry/i.test(mainText)) {
+              } else if (
+                /something went wrong/i.test(tailText) ||
+                /network error/i.test(tailText) ||
+                (/error/i.test(tailText) && /try again|retry/i.test(tailText))
+              ) {
                 errorType = 'retryable_error';
                 errorText = 'Error (reintentar)';
               }
@@ -750,18 +764,27 @@ class CometController:
             # give the UI a moment to settle
             time.sleep(0.8)
 
+        baseline = self.get_agent_status()
+        baseline_response = baseline.response
+
         self.send_prompt(prompt)
 
         deadline = time.time() + timeout_s
+        sent_at = time.time()
         last_activity = time.time()
         prev_response = ""
         saw_response = False
         done_candidate_at: float | None = None
         done_candidate_response: str = ""
         grace_s = 3.0
+        seen_working = False
+        resubmit_attempted = False
 
         while time.time() < deadline:
             st = self.get_agent_status()
+            if st.has_loading or st.has_stop_button:
+                seen_working = True
+
             if st.response and st.response != prev_response:
                 prev_response = st.response
                 last_activity = time.time()
@@ -769,7 +792,8 @@ class CometController:
                 done_candidate_at = None
 
             # Handle omitted / retryable errors
-            if st.error_type:
+            should_consider_error = seen_working or saw_response or (st.response and st.response != baseline_response)
+            if st.error_type and should_consider_error:
                 if st.has_retry_button and self.click_retry():
                     self.reset_stability()
                     prev_response = ""
@@ -777,9 +801,48 @@ class CometController:
                     done_candidate_at = None
                     done_candidate_response = ""
                     last_activity = time.time()
+                    seen_working = False
                     time.sleep(1.0)
                     continue
                 raise RuntimeError(f"Perplexity devolvió '{st.error_text or st.error_type}'.")
+
+            # If nothing seems to start (common on first send / new chat), try one resubmit.
+            if not seen_working and not saw_response and not resubmit_attempted and (time.time() - sent_at) > 6:
+                try:
+                    self._eval(
+                        """
+                        (() => {
+                          const el = document.querySelector('[contenteditable="true"]') ||
+                                     document.querySelector('textarea') ||
+                                     document.querySelector('input[type="text"]');
+                          if (!el) return false;
+                          el.focus();
+                          const down = new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true });
+                          el.dispatchEvent(down);
+                          const up = new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true });
+                          el.dispatchEvent(up);
+
+                          const selectors = [
+                            'button[aria-label*="Submit"]',
+                            'button[aria-label*="Send"]',
+                            'button[aria-label*="Ask"]',
+                            'button[type="submit"]',
+                          ];
+                          for (const sel of selectors) {
+                            const btn = document.querySelector(sel);
+                            if (btn && !btn.disabled && btn.offsetParent !== null) {
+                              btn.click();
+                              break;
+                            }
+                          }
+                          return true;
+                        })()
+                        """,
+                        timeout_s=5,
+                    )
+                except Exception:
+                    pass
+                resubmit_attempted = True
 
             now = time.time()
             idle_s = now - last_activity
@@ -803,6 +866,8 @@ class CometController:
 
         # timeout: return best effort
         st = self.get_agent_status()
-        if st.response:
+        if not saw_response and not seen_working:
+            raise RuntimeError("No se detectó actividad ni respuesta nueva (posible fallo al enviar el prompt).")
+        if st.response and (saw_response or st.response != baseline_response):
             return st.response
         raise RuntimeError("Timeout sin respuesta.")
